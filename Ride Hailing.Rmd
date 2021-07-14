@@ -1,0 +1,433 @@
+---
+title: "Multiple Time Series on Ride Hailing Data"
+author: "Dicky Prigara"
+date: "`r format(Sys.Date(), '%B %e, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,
+  warning = FALSE)
+```
+
+## Import Library
+```{r}
+library(forecast)
+library(lubridate)
+library(magrittr)
+library(tidyverse)
+library(tidymodels)
+library(padr)
+library(MLmetrics)
+```
+
+## Import Data
+```{r}
+df <- read.csv("C:/Users/user/Downloads/Algoritma/Capstone-ML/data/data-train.csv")
+head(df)
+```
+## Check Missing Value
+```{r}
+anyNA(df)
+```
+```{r}
+colSums(is.na(df))
+```
+Karena missing value hanya berasal dari coloumn id, maka bisa kita drop karena tidak akan digunakan
+
+## Data Preprocessing
+
+Pertama kita akan ubah tipe data menjadi datetime
+
+```{r}
+df[,"start_time"]<- as_datetime(df[,"start_time"])
+```
+
+waktu akan dibulatkan menjadi satuan jam kebelakang
+```{r}
+df[,"start_time"]<- floor_date(df[,"start_time"],unit = "hour")
+```
+kita akan menghitung demand setiap sub area berdasarkan pesanan yang masuk
+
+```{r}
+df_clean<- df %>%select(-c(rider_id,trip_id,driver_id,id)) %>% 
+  group_by(src_sub_area) %>% 
+  count(start_time)
+```
+
+```{r}
+data_test <- read.csv("C:/Users/user/Downloads/Algoritma/Capstone-ML/data/data-test.csv")
+```
+
+karena tidak setiap jam ada pesanan yang masuk, maka ada data yang kosong, dalam time series kita harus mengisi data kosong tersebut menggunakan padding dan mengganti nilai `NA` dengan 0.
+```{r}
+df_clean<- df_clean %>% pad()
+df_clean$n<- df_clean$n %>% replace_na(0)
+```
+lalu kita akan lihat pola time series yang terbentuk seperti apa.
+
+```{r}
+df_clean %>%
+  filter(start_time >= max(start_time) - hours(24 * 7 * 9)) %>%
+    ggplot(aes(x = start_time, y = n)) +
+    geom_line() +
+    labs(x = NULL, y = NULL) +
+    facet_wrap(~ src_sub_area, scale = "free", ncol = 1) 
+```
+
+dilihat dari pola timeseries yang terbentuk adalah additive, yaitu pola dan seasonalnya cenderung konstan.
+
+## Cross-Validation
+
+kita akan membagi dataset menjadi train-test dengan metode cross-validation.
+ukuran train size adalah 9 minggu, dan ukuran test size adalah 1 minggu
+```{r}
+test_size <- 24 * 7 
+train_size <- 24 * 7 * 9
+
+# get the min-max of the time index for each sample
+test_end <- max(df_clean$start_time)
+test_start <- test_end - hours(test_size) + hours(1)
+
+train_end <- test_start - hours(1)
+train_start <- train_end - hours(train_size) + hours(1)
+```
+
+
+```{r}
+intrain <- interval(train_start, train_end)
+intest <- interval(test_start, test_end)
+
+intrain
+#> [1] 2018-04-13 UTC--2018-07-05 23:00:00 UTC
+
+intest
+```
+
+kita akan melihat plot pembagian antara train dan test dari dataset
+```{r}
+df_clean %>%
+  mutate(sample = case_when(
+    start_time %within% intrain ~ "train",
+    start_time %within% intest ~ "test"
+  ))%>% mutate(sample = factor(sample, levels = c("train", "test"))) %>%
+  ggplot(aes(x = start_time, y = n, colour = sample)) +
+    geom_line() +
+    labs(x = NULL, y = NULL, colour = NULL) +
+    facet_wrap(~ src_sub_area, scale = "free", ncol = 1)
+
+```
+
+```{r}
+df_clean%<>%
+  spread(src_sub_area, n)
+df_clean
+```
+
+```{r}
+rec <- recipe(~ ., filter(df_clean, start_time %within% intrain)) %>%
+  step_sqrt(all_numeric()) %>%
+  step_center(all_numeric()) %>%
+  step_scale(all_numeric()) %>%
+  prep()
+
+# preview the bake results
+df_clean <- bake(rec, df_clean)
+df_clean
+```
+Kita akan membuat revert back function untuk mengubah tipe data seperti semula.
+```{r}
+rec_revert <- function(vector, rec, varname) {
+
+  # store recipe values
+  rec_center <- rec$steps[[2]]$means[varname]
+  rec_scale <- rec$steps[[3]]$sds[varname]
+
+  # convert back based on the recipe
+  results <- (vector * rec_scale + rec_center) ^ 2
+
+  # add additional adjustment if necessary
+  results <- round(results)
+
+  # return the results
+  results
+
+}
+```
+
+sekarang kita memiliki data dengan long format.
+```{r}
+df_clean %<>%
+  gather(src_sub_area, n, -start_time)
+df_clean
+```
+## Modeling
+Kita akan mempersiapkan sample indicator untuk membuat nested tabel.
+```{r}
+df_clean %<>%
+  mutate(sample = case_when(
+    start_time %within% intrain ~ "train",
+    start_time %within% intest ~ "test"
+  )) %>% drop_na()
+df_clean
+```
+disini kita mulai untuk nest data sub area dan sample yang telah dibuat
+```{r}
+df_clean %<>%
+  group_by(src_sub_area, sample) %>%
+  nest(.key = "data") %>%
+  spread(sample, data)
+df_clean
+```
+## Preparing The Data Model List
+kita akan membuat objek time series dengan daily seasonality dan multiple time series dengan daily dan weekly seasonality.
+```{r}
+data_funs <- list(
+  ts = function(x) ts(x$n, frequency = 24),
+  msts = function(x) msts(x$n, seasonal.periods = c(24, 24 * 7))
+)
+```
+
+disini kita akan convert list menjadi tabel. kita akan memberika sebuah key yaitu `src_sub_area` agar bisa menggabungkan dengan `left_join` nantinya.
+```{r}
+data_funs %<>%
+  rep(length(unique(df_clean$src_sub_area))) %>%
+  enframe("data_fun_name", "data_fun") %>%
+  mutate(src_sub_area =
+    sort(rep(unique(df_clean$src_sub_area), length(unique(.$data_fun_name))))
+  )
+```
+
+join nested function dengan nested data.
+```{r}
+df_clean%<>%
+  left_join(data_funs)
+df_clean
+```
+
+## Preparing Time Series Model
+model time series yang akan digunakan `auto.arima` , `ets` , `stlm` , dan `tbats`. Kita akan membuat sebuah fungsi untuk memanggil dan menyimpan model kedalam list. 
+```{r}
+models <- list(
+  auto.arima = function(x) auto.arima(x),
+  ets = function(x) ets(x),
+  stlm = function(x) stlm(x),
+  tbats = function(x) tbats(x, use.box.cox = FALSE)
+)
+```
+
+ubah menjadi nested format seperti sebelumnya.
+```{r}
+models %<>%
+  rep(length(unique(df_clean$src_sub_area))) %>%
+  enframe("model_name", "model") %>%
+  mutate(src_sub_area =
+    sort(rep(unique(df_clean$src_sub_area), length(unique(.$model_name))))
+  )
+models
+```
+
+gunakan `left_join` untuk menggabungkan hasil dengan nested data. Lalu kita akan memfilter `ets` dan `auto.arima` karena kurang cocok untuk digunakan pada multiple time-series.
+```{r}
+df_clean %<>%
+  left_join(models) %>%
+  filter(
+    !(model_name == "ets" & data_fun_name == "msts"),
+    !(model_name == "auto.arima" & data_fun_name == "msts")
+  ) 
+df_clean
+```
+## Execute The Nested Fitting
+agar model dapat dieksekusi, kita harus membungkus menggunakan fungsi `map` dan memanggilnya menggunakan `invoke_map`. 
+```{r}
+df_clean %<>%
+  mutate(
+    params = map(train, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)),
+    fitted = invoke_map(model, params)
+  ) %>%
+  select(-data, -params)
+df_clean
+```
+
+Kita akan menghitung error yang didapat. Pertama kita harus melakukan `forecast` ke dataset dan melakukan pipe ke fungsi pengukuran error. Disini kita akan menggunakan Mean Absolute Error (`mae_vec`).
+```{r}
+df_clean %<>%
+  mutate(error =
+    map(fitted, ~ forecast(.x, h = 24 * 7 )) %>%
+     map2_dbl(test, ~ mae_vec(truth = .y$n, estimate = .x$mean))
+  ) %>%
+  arrange(src_sub_area, error)
+df_clean %>%
+  select(src_sub_area, ends_with("_name"), error)
+df_clean
+```
+## Unnesting The Result
+kita akan melakukan unnest untuk mendapatkan tabel yang berisi hasil forecast dan data test.
+```{r}
+df_test <- df_clean %>%
+  mutate(
+    forecast =
+      map(fitted, ~ forecast(.x, h = 24 * 7 )) %>%
+      map2(test, ~ tibble(
+        start_time = .y$start_time,
+        n = as.vector(.x$mean)
+      )),
+    key = paste(data_fun_name, model_name, sep = "-")
+  )
+df_test
+```
+
+
+lalu melakukan spread-gather untuk mendapatkan kunci yang tepat.
+```{r}
+df_test %<>%
+  select(src_sub_area, key, actual = test, forecast) %>%
+  spread(key, forecast) %>%
+  gather(key, value, -src_sub_area)
+df_test
+```
+
+lalu kita akan melakukan unnest dan mengaplikasikan revert back function.
+```{r}
+df_test %<>%
+  unnest(value) %>%
+  mutate(n = rec_revert(n, rec, src_sub_area))
+df_test
+```
+
+## Model Evalutaion 1
+Kita akan melakukan evaluation pada data valuation yang telah kita bagi sebelumnya
+
+```{r}
+actual <- df_test[df_test$key=="actual",]
+actual_sxk97<- subset(actual,src_sub_area=="sxk97")
+actual_sxk9e<- subset(actual,src_sub_area=="sxk9e")
+actual_sxk9s<- subset(actual,src_sub_area=="sxk9s")
+
+forecast_all <- df_test[df_test$key!="actual",]
+forecast_sxk97<- subset(forecast_all,src_sub_area=="sxk97")
+forecast_sxk9e<- subset(forecast_all,src_sub_area=="sxk9e")
+forecast_sxk9s<- subset(forecast_all,src_sub_area=="sxk9s")
+
+MAE(forecast_all$n,actual$n)
+MAE(forecast_sxk97$n, actual_sxk97$n)
+MAE(forecast_sxk9e$n, actual_sxk9e$n)
+MAE(forecast_sxk9s$n, actual_sxk9s$n)
+
+```
+Pada data Valuation, MAE untuk semua sub area adalah 9,499. 
+untuk sub area sxk97 adalah 9,152. 
+untuk sub area sxk9e adalah 11,068.
+untuk sub area sxk9s adalah 8,275.
+
+
+Kita dapat membandingkan data forecast dan data sebenarnya pada data test seperti ini:
+```{r}
+df_test %>%
+  ggplot(aes(x = start_time, y = n, colour = key)) +
+    geom_line() +
+    labs(x = NULL, y = NULL, colour = NULL) +
+    facet_wrap(~ src_sub_area, scale = "free", ncol = 1)
+```
+
+## Automate The Model Selection 
+Berdasarkan plot yang telah kita lihat, seringkali sulit untuk kita memilih model mana yang tepat. Maka dari itu kita akan memilih model dengan error paling kecil.
+```{r}
+df_clean %<>%
+  select(-fitted) %>% # remove unused
+  group_by(src_sub_area) %>%
+  filter(error == min(error)) %>%
+  ungroup()
+df_clean
+```
+
+## Perform The Final Forecast
+Proses yang dilakukan sama seperti saat melakukan model fitting, hanya saja kali ini kita akan menggunakan train dan test dataset secara penuh.
+
+Pertama kita akan menggabungkan train dan test dataset.
+```{r}
+df_clean %<>%
+  mutate(fulldata = map2(train, test, ~ bind_rows(.x, .y))) %>%
+  select(src_sub_area, fulldata, everything(), -train, -test)
+df_clean
+```
+
+lakukan nested fitting seperti sebelumnya.
+```{r}
+df_clean %<>%
+  mutate(
+    params = map(fulldata, ~ list(x = .x)),
+    data = invoke_map(data_fun, params),
+    params = map(data, ~ list(x = .x)),
+    fitted = invoke_map(model, params)
+  ) %>%
+  select(-data, -params)
+df_clean
+```
+
+membuat tabel yang berisi hasil forecast dan convert nested data menjadi long format.
+```{r}
+df_clean %<>%
+  mutate(forecast =
+    map(fitted, ~ forecast(.x, h = 24 * 7)) %>%
+    map2(fulldata, ~ tibble(
+      start_time = timetk::tk_make_future_timeseries(.y$start_time, 24 * 7),
+      n = as.vector(.x$mean)
+    ))
+  )
+df_clean
+```
+## Assumption checking
+
+Dalam time-series, asumsi yang harus kita cek adalah Non-autocorrelation on Residuals dan Normality of Residuals
+
+```{r}
+forecast1 <- df_clean$fitted[[1]]
+forecast1 <- forecast(forecast1,h=24*7)
+shapiro.test(forecast1$residuals)
+Box.test(forecast1$residuals)
+
+forecast2 <- df_clean$fitted[[2]]
+forecast2 <- forecast(forecast2,h=24*7)
+shapiro.test(forecast2$residuals)
+Box.test(forecast2$residuals)
+
+forecast3 <- df_clean$fitted[[3]]
+forecast3 <- forecast(forecast3,h=24*7)
+shapiro.test(forecast3$residuals)
+Box.test(forecast3$residuals)
+```
+
+Dalam kasus multiple time-series kali ini, model gagal tolak H0 pada normality of residuals, hal ini dapat disebabkan pada persebaran data, jika kita kembali melihat grafik time-series yang terbentuk diawal, terdapat beberapan outlier pada data. Dan pada kasus time-series, non-normality error bukanlah isu yang serius.
+Untuk asumsi No-Autocorrelation model berhasil tolak H0 karena p-value pada Box test > 0.05
+
+Kita dapat melakukan unnest untuk mendapatkan hasil
+```{r}
+df_clean %<>%
+  select(src_sub_area, actual = fulldata, forecast) %>%
+  gather(key, value, -src_sub_area) %>%
+  unnest(value) %>%
+  mutate(n = rec_revert(n, rec, src_sub_area))
+df_clean
+```
+
+Kita dapat melakukan plot untuk melihat hasil forecast
+```{r}
+df_clean %>%
+  ggplot(aes(x = start_time, y = n, colour = key)) +
+    geom_line() +
+    labs(x = NULL, y = NULL, colour = NULL) +
+    facet_wrap(~ src_sub_area, scale = "free", ncol = 1)
+```
+
+## Model Evaluataion 2
+
+Kita akan melakukan model evaluation pada final model yang sudah melakukan forecast pada data test dengan menggunakan metrics MAE (Mean Absolute Error)
+
+```{r, echo=FALSE, out.width="100%", fig.cap="Model Evaluation 2"}
+knitr::include_graphics("mae_eval.png")
+```
+
+
